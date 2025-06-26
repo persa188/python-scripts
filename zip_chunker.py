@@ -2,8 +2,6 @@ import os
 import re
 import zlib
 import zipfile
-import tempfile
-import uuid
 import argparse
 from pathlib import Path
 from datetime import datetime
@@ -36,24 +34,13 @@ def compress_one(args):
         data = f.read()
 
     compressed = zlib.compress(data, level=6)
-    crc = zlib.crc32(data) & 0xffffffff
-
+    compressed_size = len(compressed)
     arcname = os.path.relpath(file_path, root_folder)
-    info = zipfile.ZipInfo(arcname)
-    info.compress_type = zipfile.ZIP_DEFLATED
-    info.file_size = len(data)
-    info.compress_size = len(compressed)
-    info.CRC = crc
-    info.date_time = datetime.now().timetuple()[:6]
-
-    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".zipchunk")
-    tmp_file.write(compressed)
-    tmp_file.close()
 
     return {
-        'zipinfo': info,
-        'compressed_path': tmp_file.name,
-        'size': len(compressed)
+        'path': str(file_path),
+        'arcname': arcname,
+        'size': compressed_size
     }
 
 class ZipChunker:
@@ -61,7 +48,6 @@ class ZipChunker:
         self.folder = Path(folder_to_zip).resolve()
         self.output_folder = Path(output_folder).resolve()
         self.max_chunk_size = max_chunk_size_bytes
-        self.temp_files = []
         self.base_name = self.folder.name
 
     def __enter__(self):
@@ -69,20 +55,16 @@ class ZipChunker:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        for f in self.temp_files:
-            try:
-                os.remove(f['compressed_path'])
-            except FileNotFoundError:
-                pass
+        pass  # no cleanup needed anymore
 
     def walk_files(self):
         for path in self.folder.rglob("*"):
             if path.is_file():
                 yield path
 
-    def compress_to_temp_parallel(self, process_count):
+    def compress_to_estimate_parallel(self, process_count):
         files = list(self.walk_files())
-        print(f"🧠 Using {process_count} processes for compression...")
+        print(f"🧠 Using {process_count} processes for compression estimation...")
 
         results = []
         with ProcessPoolExecutor(max_workers=process_count) as executor:
@@ -93,10 +75,9 @@ class ZipChunker:
             for future in as_completed(future_to_path):
                 try:
                     result = future.result()
-                    self.temp_files.append(result)
                     results.append(result)
                 except Exception as e:
-                    print(f"❌ Error compressing {future_to_path[future]}: {e}")
+                    print(f"❌ Error estimating {future_to_path[future]}: {e}")
 
         return results
 
@@ -118,14 +99,12 @@ class ZipChunker:
     def write_bins(self, bins):
         for i, b in enumerate(bins, 1):
             if not b['files']:
-                continue  # skip empty bin
+                continue
 
             zip_path = self.output_folder / f"{self.base_name}_part{i}.zip"
-            with zipfile.ZipFile(zip_path, 'w') as zipf:
+            with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zipf:
                 for f in b['files']:
-                    with open(f['compressed_path'], 'rb') as tmpf:
-                        data = tmpf.read()
-                    zipf.writestr(f['zipinfo'], data)
+                    zipf.write(f['path'], arcname=f['arcname'])
 
             real_size = zip_path.stat().st_size
             print(f"✅ Created: {zip_path} ({real_size // 1024} KB)")
@@ -138,8 +117,8 @@ class ZipChunker:
         if self.max_chunk_size < 1024:
             print("⚠️ Warning: Chunk size is very small — zip overhead may exceed your limit.")
 
-        print("🔄 Compressing files to temporary storage...")
-        all_files = self.compress_to_temp_parallel(process_count)
+        print("🔄 Estimating compressed sizes...")
+        all_files = self.compress_to_estimate_parallel(process_count)
 
         print("📐 Bin packing...")
         bins = self.bin_pack_files(all_files)
